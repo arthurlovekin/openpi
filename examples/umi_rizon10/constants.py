@@ -7,6 +7,10 @@ Imported by both `convert_mcap_to_lerobot.py` (which runs in the openpi venv) an
 from openpi.shared import se3
 
 # --- Dataset -----------------------------------------------------------------------------
+#
+# Only parameters of the dataset *construction* live here. Numbers measured for a particular
+# robot or recording session -- calibration transforms, the gripper encoder range, the action
+# lookahead -- live in `calibration/*.yaml`, which is their single source of truth.
 
 # Resampling rate of the LeRobot dataset. The MCAP camera stream runs at ~29 Hz, the gripper
 # encoder at 100 Hz and OptiTrack at ~117 Hz; 20 Hz is a safe common grid and is comfortably
@@ -16,10 +20,6 @@ FPS = 20
 # Must match `Pi0Config.action_horizon` in the `pi05_umi_rizon10` TrainConfig.
 # 16 frames at 20 Hz = 0.80 s.
 ACTION_HORIZON = 16
-
-# Measured command->motion lag of the Rizon10. Actions are the state shifted forward by this
-# much, so the pose recorded at t + LATENCY_S supervises the command issued at t.
-LATENCY_S = 0.110
 
 # pi0.5 resizes every image to 224x224 with `resize_with_pad`. We store the dataset already
 # resized so that the training pixels are bit-identical to what `main.py` sends at deploy time.

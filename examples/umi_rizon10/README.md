@@ -33,9 +33,19 @@ A UMI recording has no notion of "state" versus "action" — only the tracked gr
 - **state** = the EE pose at time `t`, **absolute in the robot base frame**. This is "where am
 I in the workspace".
 - **actions** = the pose at `t + latency`, expressed **relative to the pose at the chunk
-start**. This is "how do I move from here". `latency` is the measured command→motion lag of
-the Rizon10 (110 ms), so the pose the gripper actually reached is the right supervision
-target for a command issued at `t`.
+start**. This is "how do I move from here". The pose the gripper actually reached is the right
+supervision target for a command issued at `t`.
+
+`latency` = `robot_motion_lag_s` + `downlink_lag_s` from the calibration file — the Rizon10's own
+command→motion lag (110 ms) plus the measured inference-server→robot downlink (68 ms), 178 ms in
+total. It is **not** a whole number of 20 Hz frames (178 ms is 3.56 of them), so `a(t) = s(t+dt)`
+is evaluated by interpolating the *raw* streams — OptiTrack at ~117 Hz, the encoder at 100 Hz —
+at exactly `t + dt`: lerp position, SLERP rotation, lerp gripper closedness. Rounding the
+lookahead to 4 frames instead would label every action for a 200 ms lag, worth a few mm of
+position bias at the median and ~15 mm at the extremes, and would make `latency` a step function
+that ignores any measurement change under 25 ms. The cost is that the last `latency` of each
+episode is dropped, since its lookahead falls past the end of the recording; nothing real is
+lost, because an event at `T` still supervises the frame at `T - latency`.
 
 The relative step cannot be baked into the dataset, because the chunk start can be any frame.
 The dataset stores absolute actions and `ChunkRelativePoseActions` converts them in the data
@@ -108,9 +118,11 @@ What it does:
 - Reads `/camera/color/image` (JPEG 640×480, ~29 Hz), `/optitrack/pose` (m, quaternion
 **XYZW**, ~117 Hz) and `/gripper_input` (`encoder_angle` in **degrees**, 100 Hz). Gamepad
 `axes`/`buttons` are dropped.
-- Resamples onto a **20 Hz** grid with a zero-order hold (most recent sample). No interpolation
-— held values are what the policy sees online. 20 Hz is also comfortably inside the 1–100 Hz
-range the Flexiv Python RDK accepts.
+- Resamples `state` onto a **20 Hz** grid with a zero-order hold (most recent sample) — held
+values are what the policy sees online. `actions` are the deliberate exception: they are a label
+with no online counterpart, so they are interpolated at the exact lookahead (above) instead of
+being snapped to the grid. 20 Hz is also comfortably inside the 1–100 Hz range the Flexiv Python
+RDK accepts.
 - Maps poses into the robot base frame:
 `T_ee_wrt_base = inv(T_base_wrt_otworld) @ T_otbody_wrt_otworld @ T_cam_wrt_otbody @ inv(T_cam_wrt_tcp)`.
 - Writes `wrist_image` **already resized to 224×224 with** `resize_with_pad`, so training
@@ -184,7 +196,7 @@ the first rollouts.
 so an all-zero masked base view is somewhat off-distribution. The one-line fallback in
 `src/openpi/policies/rizon10_policy.py` is to also put the frame in `base_0_rgb` with its
 mask set to `np.True_`.
-- **Interpolation** instead of zero-order hold when resampling.
+- **Interpolation** instead of zero-order hold for `state` too (`actions` already interpolate).
 - **Absolute actions** in the base frame instead of chunk-relative.
 - **Rotation vectors** instead of the 6-D representation (letting the model emit magnitudes
 past 2π to dodge the wrapping discontinuity).

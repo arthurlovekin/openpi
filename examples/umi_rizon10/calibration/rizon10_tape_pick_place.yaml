@@ -33,12 +33,16 @@ T_base_wrt_otworld:
 gripper_closed_angle_deg: 36.0
 gripper_signed_range_deg: 80.5
 
-# Measured command->motion lag of the Rizon10, in seconds.
-# A UMI recording has no notion of "state" versus "action" — only the tracked gripper pose. 
-# However, on the real robot the state of the robot will always lag behind the action command 
-# by some latency, since the signal takes time to get from the inference server to the robot machine, 
-# and the robot takes time to actually achieve the commanded pose. 
-#
-# Measured H100 send -> action chunk usable    68.004 ms  +/- 21.042
-# Measured Robot latency: 110 ms
-latency_s: 0.178
+# Measured command->motion lag of the Rizon10 inference setup, in seconds 
+# (separately measured as inference_server->robot_machine + robot_machine->robot_achieving_setpoint)
+# A UMI recording has no notion of "state" versus "action" — only the tracked gripper pose.
+# However, on the real robot the state of the robot will always lag behind the action command
+# by some latency, since the signal takes time to get from the inference server to the robot machine,
+# and the robot takes time to actually achieve the commanded pose.
+
+# The robot's own command->motion lag, measured on the Rizon10.
+robot_motion_lag_s: 0.110
+
+# Inference server -> robot machine, from `calibration/measure_command_latency.py probe`:
+#   "H100 send -> action chunk usable    68.004 ms  +/- 21.042"
+downlink_lag_s: 0.068

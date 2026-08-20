@@ -120,6 +120,41 @@ def quat_wxyz_to_mat(quat: np.ndarray) -> np.ndarray:
     return _quat_to_mat(quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3])
 
 
+def slerp_quat_xyzw(q0: np.ndarray, q1: np.ndarray, weight: np.ndarray | float) -> np.ndarray:
+    """Shortest-arc spherical linear interpolation between **XYZW** quaternions.
+
+    Args:
+        q0: `(..., 4)` quaternions reached at ``weight == 0``.
+        q1: `(..., 4)` quaternions reached at ``weight == 1``.
+        weight: broadcastable to the leading `(...)` shape. Values outside `[0, 1]` extrapolate
+            along the same geodesic.
+
+    Returns:
+        `(..., 4)` unit quaternions, XYZW.
+
+    `q` and `-q` are the same rotation, so `q1` is negated wherever the dot product is negative;
+    without that the interpolation would take the long way round the sphere. Unlike a
+    component-wise lerp this has constant angular velocity, which is what makes it the right
+    thing for resampling a pose stream in time.
+    """
+    q0 = _normalize(np.asarray(q0, dtype=np.float64))
+    q1 = _normalize(np.asarray(q1, dtype=np.float64))
+    weight = np.asarray(weight, dtype=np.float64)[..., None]
+
+    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
+    q1 = np.where(dot < 0.0, -q1, q1)
+
+    theta = np.arccos(np.clip(np.abs(dot), -1.0, 1.0))
+    sin_theta = np.sin(theta)
+    # Both branches are evaluated unconditionally, so the near-parallel one must stay finite even
+    # where its result is thrown away.
+    slerped = (np.sin((1.0 - weight) * theta) * q0 + np.sin(weight * theta) * q1) / np.clip(sin_theta, 1e-8, None)
+    # Below ~1e-8 rad the chord and the arc agree to well past float64 precision, and the
+    # shortest-arc flip above guarantees the sum is nowhere near zero.
+    nlerped = _normalize(q0 + weight * (q1 - q0))
+    return np.where(sin_theta < 1e-8, nlerped, slerped)
+
+
 def mat_to_quat_wxyz(mat: np.ndarray) -> np.ndarray:
     """`(..., 3, 3)` or `(..., 4, 4)` rotation -> `(..., 4)` quaternion in **WXYZ** order.
 

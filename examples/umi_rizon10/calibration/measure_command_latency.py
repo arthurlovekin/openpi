@@ -23,6 +23,11 @@ Both ends mirror the production transport deliberately: the same `websockets` en
 `compression=None, max_size=None`, the same `msgpack_numpy` packer, and the same payload shapes that
 `_observe()` in `main.py` sends, so the bytes on the wire match what the deployed system sends.
 
+The probe prints one number -- the H100 -> robot one-way latency, ready to paste into
+`downlink_lag_s` in `calibration/*.yaml` -- plus a histogram of the raw samples and any warning
+that would make that number untrustworthy. Everything else (all ten derived metrics, their full
+percentile tables, and every raw timestamp) goes to `--out` as JSON.
+
 Usage:
 
     # on the H100 -- port 8001 so it coexists with serve_policy.py on 8000
@@ -40,6 +45,7 @@ import importlib.util
 import json
 import logging
 import pathlib
+import sys
 import time
 import types
 
@@ -211,10 +217,6 @@ class Probe:
     # computed and reported alongside, for comparison.
     clock_offset_s: float | None = None
 
-    # Robot-side command->motion lag, measured separately. Used only for the suggested `latency_s`.
-    # Defaults to `constants.LATENCY_S`.
-    robot_motion_lag_s: float | None = None
-
     # Prompt to send, so the payload size matches deployment.
     prompt: str = "pick up the tape and place it in the bin"
 
@@ -326,7 +328,6 @@ _METRIC_ORDER = (
     "downlink_decoded_ms",
     "client_pack_ms",
 )
-_COLUMNS = ("min", "p50", "p90", "p95", "p99", "max", "mean", "std")
 
 
 def _stats(values) -> dict:
@@ -345,13 +346,30 @@ def _stats(values) -> dict:
     }
 
 
-def _print_table(stats: dict) -> None:
-    width = max(len(name) for name in stats)
-    header = f"{'metric':<{width}}" + "".join(f"{c:>10}" for c in _COLUMNS)
-    print(header)
-    print("-" * len(header))
-    for name, st in stats.items():
-        print(f"{name:<{width}}" + "".join(f"{st[c]:>10.3f}" for c in _COLUMNS))
+# Block-drawing characters render a far more legible histogram, but a robot machine reached over
+# ssh with LANG=C would raise UnicodeEncodeError on the very last line of a two-minute run.
+_FULL, _PARTIAL = (
+    ("\u2588", "\u258f\u258e\u258d\u258c\u258b\u258a\u2589")
+    if ((sys.stdout.encoding or "").lower().replace("-", "").startswith("utf"))
+    else ("#", "")
+)
+
+
+def _histogram(values: list[float], bins: int = 12, width: int = 36) -> list[str]:
+    """A dependency-free horizontal histogram -- matplotlib is not in the robot-side env."""
+    counts, edges = np.histogram(np.asarray(values, dtype=np.float64), bins=bins)
+    peak = max(int(counts.max()), 1)
+    # Enough decimals that adjacent bin edges stay distinguishable: a sub-millisecond LAN and a
+    # 100 ms WAN both get readable labels.
+    step = float(edges[1] - edges[0])
+    decimals = int(np.clip(1 - np.floor(np.log10(step)) if step > 0 else 1, 0, 4))
+    lines = []
+    for count, lo, hi in zip(counts, edges[:-1], edges[1:], strict=True):
+        eighths = round(int(count) / peak * width * 8)
+        full, frac = divmod(eighths, 8)
+        bar = _FULL * full + (_PARTIAL[frac - 1] if frac and _PARTIAL else "")
+        lines.append(f"  {lo:8.{decimals}f} - {hi:<8.{decimals}f} {count:4d}  {bar}".rstrip())
+    return lines
 
 
 def _collect_load(ws, packer, payload: dict, count: int, pace_hz: float | None, into: list) -> None:
@@ -394,8 +412,6 @@ def _run_probe(args: Probe) -> None:
     pace_hz = (
         None if args.back_to_back else (args.pace_hz if args.pace_hz is not None else consts.FPS / OPEN_LOOP_HORIZON)
     )
-    robot_lag_s = consts.LATENCY_S if args.robot_motion_lag_s is None else args.robot_motion_lag_s
-
     rng = np.random.default_rng(0)
     payload = _observation_payload(consts, args.prompt, rng)
     packer = msgpack_numpy.Packer()
@@ -455,81 +471,68 @@ def _run_probe(args: Probe) -> None:
         else []
     )
 
-    # --- report ---
-    print("\n=== setup ===")
-    print(f"server                    {uri}")
-    print(f"samples                   {len(load)}{' (INTERRUPTED)' if interrupted else ''}")
-    print(f"pacing                    {'back-to-back (saturation test)' if pace_hz is None else f'{pace_hz:.2f} Hz'}")
-    print(f"warmup discarded          {args.warmup}")
+    # --- report -----------------------------------------------------------------------------
+    # One number is the point of this script; everything else is either a validity check or
+    # detail that belongs in --out.
+    wire, usable = stats["downlink_wire_ms"], stats["downlink_decoded_ms"]
     up_b, down_b = load[0]["request_bytes"], load[0]["response_bytes"]
-    ratio = f"{up_b / down_b:.0f}:1" if up_b >= down_b else f"1:{down_b / up_b:.0f}"
-    print(f"request / response bytes  {up_b} / {down_b}  (up:down = {ratio})")
-    print(f"sync exchange bytes       {sync_start['request_bytes']} / {sync_start['response_bytes']}")
-
-    print("\n=== clock offset (server_clock - probe_clock) ===")
+    # The asymmetry is why the round trip cannot simply be halved.
+    ratio = f"up:down = {up_b / down_b:.0f}:1" if up_b >= down_b else f"up:down = 1:{down_b / up_b:.0f}"
+    print("\n=== downlink: inference server -> robot machine ===")
     print(
-        f"start                     {sync_start['offset_s'] * 1e3:+.3f} ms  (min rtt {sync_start['min_rtt_s'] * 1e3:.3f} ms over {sync_start['n']})"
+        f"{uri}   {len(load)} samples{' (INTERRUPTED)' if interrupted else ''} @ "
+        f"{'back-to-back' if pace_hz is None else f'{pace_hz:.2f} Hz'}   "
+        f"request {up_b} B / response {down_b} B ({ratio})"
     )
+    print(f"\n  H100 send -> bytes arrived   {wire['p50']:7.1f} ms   p95 {wire['p95']:6.1f}   max {wire['max']:6.1f}")
     print(
-        f"end                       {sync_end['offset_s'] * 1e3:+.3f} ms  (min rtt {sync_end['min_rtt_s'] * 1e3:.3f} ms over {sync_end['n']})"
+        f"  H100 send -> chunk usable    {usable['p50']:7.1f} ms   p95 {usable['p95']:6.1f}   max {usable['max']:6.1f}"
     )
-    print(f"drift                     {drift_ppm:+.2f} ppm over {span_s:.1f} s")
-    if args.clock_offset_s is not None:
-        print(
-            f"OVERRIDE in use           {args.clock_offset_s * 1e3:+.3f} ms (--clock_offset_s); the estimate above is only reported for comparison"
-        )
-    print(f"one-way error bar         +/- {error_bar_ms:.3f} ms  (half the smallest tiny-packet rtt)")
-    print("cross-check the offset independently with `chronyc tracking` on both machines against a")
-    print("common NTP server, or `ptp4l` if the link supports it, and pass it via --clock_offset_s.")
+    print(f"  +/- {error_bar_ms:.1f} ms clock-sync error bar on both (half the smallest tiny-packet rtt)")
+    print(f"\n  downlink_lag_s = {usable['p50'] / 1e3:.4f}   <- for examples/umi_rizon10/calibration/*.yaml")
 
-    print("\n=== latencies (ms) ===")
-    _print_table(stats)
+    print(f"\n  distribution of 'chunk usable' (ms), n={len(metrics)}")
+    for line in _histogram([m["downlink_decoded_ms"] for m in metrics]):
+        print(line)
 
+    print(
+        f"\nfor reference: uplink {stats['uplink_ms']['p50']:.1f} ms, msgpack decode "
+        f"{stats['client_decode_ms']['p50']:.1f} ms, server handling "
+        f"{stats['server_handling_ms']['p50']:.1f} ms, clock drift {drift_ppm:+.0f} ppm over {span_s:.0f} s"
+    )
+
+    problems = []
     negative = sum(1 for m in metrics if m["downlink_wire_ms"] < 0)
-    print("\n=== diagnostics ===")
-    print(f"samples with negative downlink   {negative}/{len(metrics)}")
+    # Only meaningful for a positive measurement -- a negative one is already covered below, and
+    # comparing against half of a negative number would flag every run.
+    weak_split = usable["p50"] > 0 and error_bar_ms > 0.5 * usable["p50"]
     if negative:
-        print("  -> the offset estimate is biased beyond its error bar (asymmetric routing, or the")
-        print("     clock stepped mid-run). Treat the one-way split as unreliable and get an")
-        print("     external offset via --clock_offset_s.")
+        problems.append(
+            f"{negative}/{len(metrics)} samples have a NEGATIVE downlink, so the clock offset is "
+            "biased past its error bar (asymmetric routing, or the clock stepped mid-run). Treat "
+            "the one-way split as unreliable."
+        )
+    if weak_split:
+        problems.append(
+            f"the error bar (+/- {error_bar_ms:.1f} ms) exceeds half the measured value, so the "
+            "one-way split is only weakly determined."
+        )
     if abs(drift_ppm) > 100:
-        print(f"  -> {drift_ppm:+.0f} ppm of clock drift is large; check that ntp/chrony is running on both hosts.")
+        problems.append(f"{drift_ppm:+.0f} ppm of clock drift is large; check ntp/chrony on both hosts.")
     if client_rtts:
-        cs = _stats(client_rtts)
-        print(f"real WebsocketClientPolicy.infer round trip  p50 {cs['p50']:.3f} ms (n={cs['n']})")
-        print(f"this harness round_trip_total_ms             p50 {stats['round_trip_total_ms']['p50']:.3f} ms")
-        gap = abs(cs["p50"] - stats["round_trip_total_ms"]["p50"])
-        print(f"  gap {gap:.3f} ms; both are paced identically, so a large gap means this harness is")
-        print("  not measuring the same path the deployed client takes.")
-
-    print("\n=== what this means ===")
-    wire, decoded = stats["downlink_wire_ms"]["p50"], stats["downlink_decoded_ms"]["p50"]
-    print(
-        f"H100 send -> robot wire arrival     {wire:.3f} ms  +/- {error_bar_ms:.3f}   (p95 {stats['downlink_wire_ms']['p95']:.3f})"
-    )
-    print(
-        f"H100 send -> action chunk usable    {decoded:.3f} ms  +/- {error_bar_ms:.3f}   (p95 {stats['downlink_decoded_ms']['p95']:.3f})"
-    )
-    print(f"  of which msgpack decode           {stats['client_decode_ms']['p50']:.3f} ms  (clock-independent)")
-    print(f"robot->H100 uplink, for contrast    {stats['uplink_ms']['p50']:.3f} ms  +/- {error_bar_ms:.3f}")
-
-    suggested = robot_lag_s + decoded / 1e3
-    old_shift = round(robot_lag_s * consts.FPS)
-    new_shift = round(suggested * consts.FPS)
-    print(
-        f"\nsuggested latency_s = {robot_lag_s:.3f} (robot command->motion) + {decoded / 1e3:.4f} (downlink) = {suggested:.4f} s"
-    )
-    print(f"action shift = round(latency_s * {consts.FPS} Hz) = {new_shift} steps", end="")
-    print(
-        f"  (UNCHANGED from {old_shift})"
-        if new_shift == old_shift
-        else f"  (CHANGED from {old_shift} -- re-run convert_mcap_to_lerobot.py)"
-    )
-    print("\nCaveat: the downlink is only part of the lag the policy actually incurs. The full")
-    print("observation-capture -> motion lag is uplink + inference + downlink + robot command->motion.")
-    print("Inference time is not measured here (this probe does not run the model); take it from")
-    print("`server_timing.infer_ms` on the real policy server. Which of the two numbers belongs in")
-    print("`latency_s` is a modelling decision, not a measurement one.")
+        # Both are paced identically, so a large gap means this harness is not measuring the path
+        # the deployed client actually takes.
+        gap = abs(_stats(client_rtts)["p50"] - stats["round_trip_total_ms"]["p50"])
+        if gap > 0.25 * stats["round_trip_total_ms"]["p50"]:
+            problems.append(
+                f"a real WebsocketClientPolicy.infer() round trip differs from this harness by "
+                f"{gap:.1f} ms at p50; the harness may not be on the deployed path."
+            )
+    for problem in problems:
+        print(f"\nWARNING: {problem}")
+    if negative or weak_split:
+        print("  -> get an external offset (`chronyc tracking` on both hosts against a common NTP")
+        print("     server, or `ptp4l`) and pass it as --clock_offset_s.")
 
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -547,7 +550,6 @@ def _run_probe(args: Probe) -> None:
                         "response_bytes": down_b,
                         "fps": consts.FPS,
                         "action_horizon": consts.ACTION_HORIZON,
-                        "robot_motion_lag_s": robot_lag_s,
                     },
                     "clock": {
                         "sync_start": sync_start,
@@ -558,7 +560,7 @@ def _run_probe(args: Probe) -> None:
                     },
                     "stats": stats,
                     "client_rtt_ms": client_rtts,
-                    "suggested_latency_s": suggested,
+                    "downlink_lag_s": usable["p50"] / 1e3,
                     "samples_raw": load,
                     "metrics_raw": metrics,
                 },
