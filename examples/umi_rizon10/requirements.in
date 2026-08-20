@@ -1,0 +1,10 @@
+# Conversion-side dependencies. Install these INTO the openpi venv, because
+# convert_mcap_to_lerobot.py needs both these and openpi's pinned `lerobot`:
+#
+#   uv pip install -r examples/umi_rizon10/requirements.in
+#
+# The robot-side runtime (main.py) does NOT use this file -- see README.md.
+mcap
+mcap-protobuf-support
+protobuf
+pyyaml

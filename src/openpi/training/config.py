@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.rizon10_policy as rizon10_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -347,6 +348,57 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRizon10DataConfig(DataConfigFactory):
+    """Cartesian end-effector pose data config for a Flexiv Rizon10 + Grav gripper.
+
+    The dataset is produced by ``examples/umi_rizon10/convert_mcap_to_lerobot.py`` from
+    hand-held UMI demonstrations. State and actions are both 10-D EE poses (see
+    ``openpi.shared.se3``): the state is absolute in the robot base frame, and the stored
+    actions are absolute too. ``ChunkRelativePoseActions`` rewrites the chunk into
+    chunk-start-relative poses at load time, which is the space the model actually learns.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Match the dataset column names to the keys ``examples/umi_rizon10/main.py`` sends.
+        # Training only -- at inference the robot client already speaks these keys.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[rizon10_policy.Rizon10Inputs(model_type=model_config.model_type)],
+            outputs=[rizon10_policy.Rizon10Outputs()],
+        )
+
+        # The SE(3) counterpart of the DeltaActions/AbsoluteActions pair used by the joint-space
+        # configs. ``push`` appends to the end of ``inputs`` and the *beginning* of ``outputs``,
+        # so at inference the composition runs before the actions are sliced back down to 10-D.
+        data_transforms = data_transforms.push(
+            inputs=[rizon10_policy.ChunkRelativePoseActions()],
+            outputs=[rizon10_policy.AbsolutePoseActions()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -759,6 +811,36 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning UMI -> Flexiv Rizon10 configs (Cartesian end-effector pose space).
+    #
+    TrainConfig(
+        name="pi05_umi_rizon10",
+        # action_horizon=16 at the dataset's 20 Hz is a 0.8 s chunk.
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False),
+        data=LeRobotRizon10DataConfig(
+            repo_id="umi/rizon10_tape_pick_place",
+            base_config=DataConfig(prompt_from_task=True),
+            # NOTE: deliberately no ``assets=AssetsConfig(...)``. The pretrained ur5e/DROID norm
+            # stats describe joint spaces and are meaningless for this 10-D Cartesian space, so we
+            # compute fresh ones. Leaving ``assets`` unset also keeps ``asset_id == repo_id``,
+            # which is required for scripts/compute_norm_stats.py (writes to ``repo_id``) and
+            # DataConfigFactory._load_norm_stats (reads from ``asset_id``) to agree.
+        ),
+        # The dataset is small (195 episodes, ~23 min, ~27k frames at 20 Hz), so libero's
+        # batch_size=256 / 10k-step warmup would spend a third of training still ramping the LR.
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
     #

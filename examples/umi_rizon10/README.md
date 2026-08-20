@@ -1,0 +1,204 @@
+# UMI → Flexiv Rizon10 (Cartesian end-effector pose)
+
+Fine-tune π0.5 on hand-held [UMI](https://umi-gripper.github.io/) gripper demonstrations and
+deploy on a Flexiv Rizon10 with a Grav gripper, operating in **Cartesian EE-pose space**
+rather than joint space.
+
+## What makes this different from the other examples
+
+
+|              | libero / DROID                | here                                               |
+| ------------ | ----------------------------- | -------------------------------------------------- |
+| action space | joint velocity / OSC deltas   | **SE(3) end-effector pose**                        |
+| state        | joint or EE pose, absolute    | EE pose, absolute, **robot base frame**            |
+| actions      | absolute or elementwise delta | pose **relative to the chunk-start state**         |
+| rotation     | axis-angle                    | first two **columns** of the rotation matrix (6-D) |
+
+
+Both state and actions are 10-D (`openpi.shared.se3`):
+
+```
+[ x, y, z, r11, r21, r31, r12, r22, r32, gripper ]
+   └ 3 ┘  └─ first two COLUMNS of R ──┘  └1┘
+```
+
+The 6-D rotation representation has no wrapping discontinuity, and Gram–Schmidt decoding
+absorbs small regression errors back onto SO(3). The gripper channel is a normalized
+closedness in `[0, 1]` (`0` = open, `1` = closed), the openpi convention.
+
+### State vs. action, and why they are in different frames
+
+A UMI recording has no notion of "state" versus "action" — only the tracked gripper pose. However, on the real robot the state of the robot will always lag behind the action command by some latency, since the signal takes time to get from the inference server to the robot machine, and the robot takes time to actually achieve the commanded pose. We synthesize the split:
+
+- **state** = the EE pose at time `t`, **absolute in the robot base frame**. This is "where am
+I in the workspace".
+- **actions** = the pose at `t + latency`, expressed **relative to the pose at the chunk
+start**. This is "how do I move from here". `latency` is the measured command→motion lag of
+the Rizon10 (110 ms), so the pose the gripper actually reached is the right supervision
+target for a command issued at `t`.
+
+The relative step cannot be baked into the dataset, because the chunk start can be any frame.
+The dataset stores absolute actions and `ChunkRelativePoseActions` converts them in the data
+loader; `AbsolutePoseActions` undoes it at inference, so **the policy server returns absolute
+base-frame poses** that `main.py` can servo to directly.
+
+A useful consequence: chunk-relative actions are *invariant* to the robot-base ↔ OptiTrack
+calibration (`inv(T_s) @ T_a` cancels any fixed left-multiplication). Only `state` depends on
+it, so re-converting after measuring that transform changes nothing else.
+
+> Note on `openpi.transforms.DeltaActions` / `AbsoluteActions`: those subtract the state
+> elementwise, which is meaningless for a 6-D rotation representation. That is why this example
+> ships SE(3) counterparts instead of reusing them.
+
+
+
+## Environments
+
+Two different environments are involved.
+
+**Conversion + training** — the openpi venv, plus the MCAP reader:
+
+```bash
+uv pip install -r examples/umi_rizon10/requirements.in
+```
+
+**Robot runtime** (`main.py`) — the environment that has `flexivrdk` (on this machine, the
+`flexiv_zed` conda env). It needs `openpi-client`, `numpy`, `opencv-python`, `tyro`, and
+`openpi.shared.se3`. The `openpi` and `openpi.shared` packages have empty `__init__.py` files
+and `se3.py` is pure numpy, so putting the source tree on `PYTHONPATH` is enough — no need to
+install openpi's JAX stack on the robot machine:
+
+```bash
+conda activate flexiv_zed
+pip install openpi-client tyro
+PYTHONPATH=/path/to/openpi/src python examples/umi_rizon10/main.py --robot_sn Rizon10-062394
+```
+
+
+
+## 1. Calibration
+
+Edit `calibration/rizon10_tape_pick_place.yaml`. Two entries are marked `MEASURE ME`:
+
+- `T_base_wrt_otworld` — robot base pose in the OptiTrack world frame. Ships as identity;
+the converter warns loudly. Until it is measured, `state` is in the raw OptiTrack world frame
+(positions around `z ≈ 4.6 m`) and will **not** match what the robot reports at deploy time.
+- `gripper_closed_angle_deg` **/** `gripper_signed_range_deg` — the encoder calibration, in
+degrees. The shipped values (36° closed, 90° open) are *inferred from the data*, not
+measured: the encoder piles up hard at 35.97–36.3° (a mechanical stop), clusters at 48–51°
+(jaws held apart by the tape roll), and reaches 83–90.6°. Verify against the hardware; if it
+is backwards, negate `gripper_signed_range_deg` and move `gripper_closed_angle_deg` to the
+other end. The converter prints both distributions on every run.
+
+`T_cam_wrt_otbody` and `T_cam_wrt_tcp` are already filled in from the earlier calibration run.
+
+## 2. Convert MCAP → LeRobot
+
+```bash
+uv run examples/umi_rizon10/convert_mcap_to_lerobot.py \
+    --data_dir /home/arthur/Downloads/umi_datasets/tape_pick_place_mcap \
+    --task "pick up the tape and place it in the bin"
+```
+
+Add `--max_episodes 3` for a fast smoke run. The dataset lands under `$HF_LEROBOT_HOME`
+(default `~/.cache/huggingface/lerobot`) as `umi/rizon10_tape_pick_place`.
+
+What it does:
+
+- Reads `/camera/color/image` (JPEG 640×480, ~29 Hz), `/optitrack/pose` (m, quaternion
+**XYZW**, ~117 Hz) and `/gripper_input` (`encoder_angle` in **degrees**, 100 Hz). Gamepad
+`axes`/`buttons` are dropped.
+- Resamples onto a **20 Hz** grid with a zero-order hold (most recent sample). No interpolation
+— held values are what the policy sees online. 20 Hz is also comfortably inside the 1–100 Hz
+range the Flexiv Python RDK accepts.
+- Maps poses into the robot base frame:
+`T_ee_wrt_base = inv(T_base_wrt_otworld) @ T_otbody_wrt_otworld @ T_cam_wrt_otbody @ inv(T_cam_wrt_tcp)`.
+- Writes `wrist_image` **already resized to 224×224 with** `resize_with_pad`, so training
+pixels are bit-identical to what `main.py` sends.
+- Writes `task` per frame, so `prompt_from_task=True` works.
+
+Episode files are globbed rather than counted — the numbering is not contiguous
+(`episode_192` is absent from this corpus).
+
+## 3. Norm stats
+
+```bash
+uv run scripts/compute_norm_stats.py --config-name pi05_umi_rizon10
+```
+
+Fresh stats only — the pretrained `ur5e` / DROID assets describe **joint** spaces and are
+meaningless here. This runs the real repack → `Rizon10Inputs` → `ChunkRelativePoseActions`
+chain, so it doubles as an end-to-end check of the frame math. Inspect the result:
+
+- `actions` rotation channels should have **mean** `r11 ≈ r22 ≈ 1` and off-diagonals **≈ 0** —
+chunk-relative rotations centred on identity.
+- `actions` translation means should be **≈ 0**.
+- `state` translations should span the physical workspace.
+
+Anything else means the frame chain is wrong.
+
+## 4. Train
+
+```bash
+uv run scripts/train.py pi05_umi_rizon10 --exp-name=my_experiment --overwrite
+```
+
+`pi05_umi_rizon10` uses `action_horizon=16` (0.80 s at 20 Hz) and `batch_size=32`. The dataset
+is small — 195 episodes, ~23 min, ~27k frames — so it deliberately departs from `pi05_libero`'s
+`batch_size=256` and 10k-step warmup, which would leave the LR still ramping for a third of a
+30k-step run.
+
+## 5. Serve and run
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint \
+    --policy.config=pi05_umi_rizon10 \
+    --policy.dir=checkpoints/pi05_umi_rizon10/my_experiment/29999
+```
+
+```bash
+PYTHONPATH=/path/to/openpi/src python examples/umi_rizon10/main.py \
+    --robot_sn Rizon10-062394 --gripper_name Grav --remote_host <server-ip>
+```
+
+`main.py` replans every `open_loop_horizon=8` steps (0.4 s) and paces the loop at 20 Hz.
+
+### Before the first rollout
+
+- **Wrist camera.** `WristCamera` in `main.py` assumes a plain V4L2 device. Replace it with the
+real driver, and make sure it is the *same* camera `T_cam_wrt_tcp` was measured for.
+- **Speed.** The human demonstrations reach ~0.6 m/s and ~70 °/s at the 90th percentile
+(max ~0.87 m/s, ~138 °/s). The Flexiv NRT defaults are 0.5 m/s and 1.0 rad/s (~57 °/s), so
+the robot will lag behind fast chunks. `main.py` starts *below* those defaults
+(`--max_linear_vel 0.25`, `--max_angular_vel 0.8`); raise them deliberately.
+- `--max_jump_m`**.** Aborts if a commanded pose is more than 30 cm from the current TCP. A
+wrong `T_base_wrt_otworld` presents exactly as an immediate large jump, so leave this on for
+the first rollouts.
+
+
+
+## Known experiments to try
+
+- **Camera slot.** The single UMI camera goes in `left_wrist_0_rgb`, with `base_0_rgb` and
+`right_wrist_0_rgb` zero-filled and masked off. π0.5 pretraining rarely masks `base_0_rgb`,
+so an all-zero masked base view is somewhat off-distribution. The one-line fallback in
+`src/openpi/policies/rizon10_policy.py` is to also put the frame in `base_0_rgb` with its
+mask set to `np.True_`.
+- **Interpolation** instead of zero-order hold when resampling.
+- **Absolute actions** in the base frame instead of chunk-relative.
+- **Rotation vectors** instead of the 6-D representation (letting the model emit magnitudes
+past 2π to dodge the wrapping discontinuity).
+- `<control_mode>` prompt tags — not used here; see
+[openpi#695](https://github.com/Physical-Intelligence/openpi/issues/695).
+
+
+
+## Tests
+
+```bash
+uv run pytest src/openpi/shared/se3_test.py
+```
+
+On a machine with ROS on the `PYTHONPATH`, prefix with
+`PYTHONPATH= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` — ROS's `launch_testing` pytest plugin
+otherwise gets autoloaded and fails to import.

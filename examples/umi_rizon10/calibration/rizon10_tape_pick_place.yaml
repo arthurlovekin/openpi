@@ -1,0 +1,56 @@
+# Calibration for the tape_pick_place UMI dataset -> Flexiv Rizon10-062394.
+#
+# Frame chain used by convert_mcap_to_lerobot.py:
+#   T_ee_wrt_base(t) = inv(T_base_wrt_otworld) @ T_otbody_wrt_otworld(t) @ T_ee_wrt_otbody
+#   T_ee_wrt_otbody  = T_cam_wrt_otbody @ inv(T_cam_wrt_tcp)
+# where T_otbody_wrt_otworld(t) comes straight from /optitrack/pose.
+
+# Camera pose in the UMI (grumi) OptiTrack RIGID BODY frame.
+# Copied from /home/arthur/Downloads/umi_datasets/tape_pick_place/grumi_transform.yaml
+# (its key is named `T_cam_wrt_optitrack`).
+T_cam_wrt_otbody:
+- [-0.3665489050790483,  0.6747845959413881, -0.6405526124102285, -0.014866458865952933]
+- [-0.7527093232961064, -0.6197453172189393, -0.22213603131485418, 0.06042237722193028]
+- [-0.5468734541084148,  0.4007262043657912,  0.7350836240361485, -0.07158234703775931]
+- [0.0, 0.0, 0.0, 1.0]
+
+# Camera pose in the Rizon10 TCP frame.
+# Copied from /home/arthur/Downloads/umi_datasets/tape_pick_place/camera_extrinsics.yaml
+T_cam_wrt_tcp:
+- [ 0.05001323294427205,  0.9551597398447841,  0.2918365088711591, -0.1359593416651367]
+- [-0.9987261102506017,   0.045870440942744506, 0.02102520752385234, -0.003631345961687016]
+- [ 0.006695762403554184, -0.29251627993560003, 0.956237100691284, -0.16013815825406713]
+- [0.0, 0.0, 0.0, 1.0]
+
+# !!! MEASURE ME !!!
+# Robot base pose in the OptiTrack world frame. Identity is a PLACEHOLDER -- the converter
+# warns loudly when it sees identity here.
+#
+# Only the `state` column depends on this. Chunk-relative `actions` are mathematically
+# invariant to it (inv(T_s) @ T_a cancels any fixed left-multiplication), so re-converting
+# after measuring it changes nothing else. Until it is measured, `state` lives in the raw
+# OptiTrack world frame (positions around z ~ 4.6 m), which will NOT match what the robot
+# reports at deploy time.
+T_base_wrt_otworld:
+- [1.0, 0.0, 0.0, 0.0]
+- [0.0, 1.0, 0.0, 0.0]
+- [0.0, 0.0, 1.0, 0.0]
+- [0.0, 0.0, 0.0, 1.0]
+
+# !!! MEASURE ME !!!
+# UMI gripper encoder calibration, in DEGREES (the /gripper_input.encoder_angle units).
+#   open_angle = gripper_closed_angle_deg + gripper_signed_range_deg
+# The signed range avoids directional ambiguity and wrap-to-360 errors.
+#
+# These values are INFERRED FROM THE DATA, not measured. Over the corpus the encoder shows:
+#   - a hard pile-up at 35.97-36.3 deg (~25% of frames) -- a mechanical stop,
+#   - a cluster at 48-51 deg -- consistent with jaws held apart by the tape roll,
+#   - excursions out to 83-90.6 deg -- the other extreme.
+# That reads as 36 deg = fully closed, ~90 deg = fully open. Verify against the hardware:
+# if it is backwards, negate gripper_signed_range_deg and move gripper_closed_angle_deg to
+# the other end. The converter prints the encoder and closedness distributions on every run.
+gripper_closed_angle_deg: 36.0
+gripper_signed_range_deg: 54.0
+
+# Measured command->motion lag of the Rizon10, in seconds.
+latency_s: 0.110
