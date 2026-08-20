@@ -38,4 +38,7 @@ gripper_signed_range_deg: 80.5
 # However, on the real robot the state of the robot will always lag behind the action command 
 # by some latency, since the signal takes time to get from the inference server to the robot machine, 
 # and the robot takes time to actually achieve the commanded pose. 
-latency_s: 0.110
+#
+# Measured H100 send -> action chunk usable    68.004 ms  +/- 21.042
+# Measured Robot latency: 110 ms
+latency_s: 0.178
