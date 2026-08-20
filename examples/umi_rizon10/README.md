@@ -28,7 +28,7 @@ closedness in `[0, 1]` (`0` = open, `1` = closed), the openpi convention.
 
 ### State vs. action, and why they are in different frames
 
-A UMI recording has no notion of "state" versus "action" — only the tracked gripper pose. However, on the real robot the state of the robot will always lag behind the action command by some latency, since the signal takes time to get from the inference server to the robot machine, and the robot takes time to actually achieve the commanded pose. We synthesize the split:
+A UMI recording has no notion of "state" versus "action" — only the tracked gripper pose. However, on the real robot the state of the robot will always lag behind the action command by some latency, since the signal takes time to get from the inference server to the robot machine, and the robot takes time to actually achieve the commanded pose. Mathematically, `s(t)=a(t-dt)` (or equivalently `a(t) = s(t+dt)`). We synthesize the split:
 
 - **state** = the EE pose at time `t`, **absolute in the robot base frame**. This is "where am
 I in the workspace".
