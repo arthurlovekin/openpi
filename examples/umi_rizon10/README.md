@@ -104,14 +104,24 @@ other end. The converter prints both distributions on every run.
 
 ## 2. Convert MCAP → LeRobot
 
+LeRobot identifies datasets by `repo_id` and looks them
+up under `$HF_LEROBOT_HOME/<repo_id>`. If that folder is missing, the loader hits the
+Hugging Face Hub and fails with a 401 for a local-only dataset. **Set this to the same
+value for convert, norm stats, and train** (put it in your shell rc or tmux session):
+
+```bash
+export HF_LEROBOT_HOME=/mnt/data3/umi_datasets/lerobot_pi
+```
+
 ```bash
 uv run examples/umi_rizon10/convert_mcap_to_lerobot.py \
-    --data_dir /home/arthur/Downloads/umi_datasets/tape_pick_place_mcap \
+    --data_dir /mnt/data3/umi_datasets/tape_pick_place_mcap \
     --task "pick up the tape and place it in the bin"
 ```
 
-Add `--max_episodes 3` for a fast smoke run. The dataset lands under `$HF_LEROBOT_HOME`
-(default `~/.cache/huggingface/lerobot`) as `umi/rizon10_tape_pick_place`.
+Add `--max_episodes 3` for a fast smoke run. The dataset lands at
+`$HF_LEROBOT_HOME/umi/rizon10_tape_pick_place` (default home is
+`~/.cache/huggingface/lerobot` if you skip the export).
 
 What it does:
 
@@ -135,6 +145,7 @@ Episode files are globbed rather than counted — the numbering is not contiguou
 ## 3. Norm stats
 
 ```bash
+export HF_LEROBOT_HOME=/mnt/data3/umi_datasets/lerobot_pi   # same as convert
 uv run scripts/compute_norm_stats.py --config-name pi05_umi_rizon10
 ```
 
@@ -152,7 +163,9 @@ Anything else means the frame chain is wrong.
 ## 4. Train
 
 ```bash
-uv run scripts/train.py pi05_umi_rizon10 --exp-name=my_experiment --overwrite
+export HF_LEROBOT_HOME=/mnt/data3/umi_datasets/lerobot_pi   # same as convert
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_umi_rizon10 \
+    --exp-name=my_experiment --overwrite
 ```
 
 `pi05_umi_rizon10` uses `action_horizon=16` (0.80 s at 20 Hz) and `batch_size=32`. The dataset
@@ -162,18 +175,58 @@ is small — 195 episodes, ~23 min, ~27k frames — so it deliberately departs f
 
 ## 5. Serve and run
 
+Three terminals: the GPU box runs the policy server, the robot laptop forwards a local
+port to that server over SSH, then the robot client talks to `localhost`.
+
+The server binds `0.0.0.0` and defaults to **port 8000**. Override it with `--port`
+(a **top-level** flag — it must come *before* `policy:checkpoint`). Use the same number
+on the tunnel and on `--remote_port`. The example below uses **8001**.
+
+### Terminal 1 — GPU box (`arthur@40.78.176.163`, openpi repo)
+
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint \
+cd /mnt/data3/arthur/openpi
+uv run scripts/serve_policy.py --port 8001 policy:checkpoint \
     --policy.config=pi05_umi_rizon10 \
     --policy.dir=checkpoints/pi05_umi_rizon10/my_experiment/29999
 ```
 
+Leave this running. You should see a log line with the hostname / IP; the websocket
+is now listening on port 8001.
+
+### Terminal 2 — robot laptop, SSH tunnel
+
+In a separate terminal on the robot machine, set up local port forwarding. Any traffic
+sent to port 8001 on the laptop is forwarded to port 8001 on the GPU box. Keep this
+open for the whole rollout (`-N` means "no remote command, just the tunnel"):
+
 ```bash
-PYTHONPATH=/path/to/openpi/src python examples/umi_rizon10/main.py \
-    --robot_sn Rizon10-062394 --gripper_name Grav --remote_host <server-ip>
+ssh -N -L 8001:localhost:8001 arthur@40.78.176.163
 ```
 
-`main.py` replans every `open_loop_horizon=8` steps (0.4 s) and paces the loop at 20 Hz.
+If the GPU box already listens on 8000 and you did not pass `--port`, forward 8000 instead:
+`ssh -N -L 8000:localhost:8000 arthur@40.78.176.163`.
+
+### Terminal 3 — robot laptop, client (`flexiv_zed` env)
+
+This is **not** the openpi training venv. `main.py` needs `flexivrdk`, `openpi-client`,
+`numpy`, `opencv-python`, `tyro`. Put the openpi source tree on `PYTHONPATH` so
+`openpi.shared.se3` imports without installing JAX on the robot:
+
+```bash
+conda activate flexiv_zed
+cd /home/bimanual/arthur/openpi
+PYTHONPATH=/home/bimanual/arthur/openpi/src python examples/umi_rizon10/main.py \
+    --robot_sn Rizon10-062394 \
+    --gripper_name Grav \
+    --remote_host localhost \
+    --remote_port 8001 \
+    --prompt "pick up the tape and place it in the bin"
+```
+
+`--remote_host localhost` is required once the tunnel is up; do not point at the GPU
+public IP from the client. `main.py` replans every `open_loop_horizon=8` steps (0.4 s)
+and paces the loop at 20 Hz.
 
 ### Before the first rollout
 
